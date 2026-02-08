@@ -19,8 +19,9 @@ Output (written to same directory as input file):
 import json
 import sys
 import os
+import math
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from typing import List, Dict, Set, Tuple, Optional, Any
 
@@ -34,77 +35,188 @@ MAX_PER_TOPIC = 30
 # Max chars to include from a message in summaries
 MAX_MSG_PREVIEW = 500
 
-# Topic keyword mappings for classification
-TOPIC_KEYWORDS: Dict[str, List[str]] = {
-    "coding_and_development": [
-        "code", "python", "javascript", "react", "api", "function", "debug",
-        "error", "script", "programming", "github", "git", "deploy",
-        "database", "sql", "html", "css", "node", "npm", "typescript",
-        "rust", "java", "docker", "kubernetes", "aws", "backend", "frontend",
-        "refactor", "test", "ci/cd", "terminal", "cli", "framework", "sdk",
-        "webpack", "vite", "nextjs", "django", "flask", "fastapi", "express",
-        "postgres", "mongodb", "redis", "graphql", "rest api", "websocket",
-    ],
-    "ai_and_machine_learning": [
-        "ai", "artificial intelligence", "machine learning", "llm",
-        "gpt", "claude", "model", "prompt", "chatgpt", "openai",
-        "anthropic", "neural", "training", "fine-tune", "embedding",
-        "vector", "rag", "agent", "transformer", "token",
-        "inference", "diffusion", "stable diffusion", "midjourney",
-        "ai agent", "function calling",
-    ],
-    "career_and_professional": [
-        "resume", "interview", "job", "career", "linkedin", "salary",
-        "manager", "leadership", "promotion", "hire", "role", "company",
-        "startup", "business", "consulting", "freelance", "client",
-        "project management", "agile", "scrum", "stakeholder",
-        "performance review", "negotiation", "networking",
-    ],
-    "health_and_fitness": [
-        "health", "fitness", "workout", "exercise", "diet", "nutrition",
-        "supplement", "protein", "weight", "muscle",
-        "running", "marathon", "cycling", "swimming",
-        "sleep", "meditation", "fasting", "calories", "macro",
-    ],
-    "finance_and_investing": [
-        "invest", "stock", "trading", "portfolio", "market", "crypto",
-        "bitcoin", "ethereum", "finance", "budget", "savings", "retirement",
-        "401k", "ira", "dividend", "broker", "forex",
-        "revenue", "profit", "roi", "real estate",
-    ],
-    "writing_and_content": [
-        "write", "blog", "article", "essay", "story", "creative writing",
-        "content", "copywriting", "edit", "draft", "outline", "publish",
-        "newsletter", "book", "chapter", "narrative", "tone", "voice",
-    ],
-    "productivity_and_tools": [
-        "notion", "obsidian", "todoist", "calendar", "workflow",
-        "automation", "zapier", "shortcut", "template",
-        "spreadsheet", "organize", "system", "process", "efficiency",
-        "time management",
-    ],
-    "personal_and_lifestyle": [
-        "travel", "recipe", "hobby", "family", "relationship", "home",
-        "moving", "city", "recommendation", "movie", "music", "game",
-        "pet", "car", "shopping", "gift", "vacation", "restaurant",
-    ],
-    "education_and_learning": [
-        "learn", "course", "tutorial", "study", "concept", "explain",
-        "textbook", "certification", "degree", "university", "research",
-        "paper", "mathematics", "physics", "philosophy", "history",
-    ],
+# Minimal topic seeds — expanded at runtime via TF-IDF analysis of conversation data.
+# Each category needs only a few anchor words; discover_topics() finds additional
+# keywords by analyzing which terms frequently co-occur with these seeds.
+TOPIC_SEEDS: Dict[str, List[str]] = {
+    "coding_and_development": ["code", "programming", "debug", "software", "deploy"],
+    "ai_and_machine_learning": ["machine learning", "neural network", "llm", "ai model"],
+    "career_and_professional": ["resume", "interview", "career", "salary", "job search"],
+    "health_and_fitness": ["workout", "exercise", "fitness", "nutrition", "diet"],
+    "finance_and_investing": ["invest", "stock", "finance", "budget", "portfolio"],
+    "writing_and_content": ["blog", "article", "essay", "writing", "draft"],
+    "productivity_and_tools": ["workflow", "automation", "productivity", "organize"],
+    "personal_and_lifestyle": ["travel", "recipe", "hobby", "vacation", "restaurant"],
+    "education_and_learning": ["tutorial", "course", "study", "textbook", "certification"],
 }
 
-# Tech/tools to detect for the user's toolchain
-TECH_PATTERNS = [
-    "python", "javascript", "typescript", "react", "vue", "angular", "svelte",
-    "node.js", "nodejs", "next.js", "nextjs", "django", "flask", "fastapi",
-    "express", "docker", "kubernetes", "aws", "gcp", "azure", "terraform",
-    "github", "gitlab", "notion", "obsidian", "figma", "slack", "linear",
-    "vscode", "neovim", "vim", "postgres", "postgresql", "mongodb", "redis",
-    "mysql", "grafana", "prometheus", "jenkins", "vercel", "netlify",
-    "supabase", "firebase", "stripe", "tailwind", "langchain",
-]
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TOPIC & TECH DISCOVERY
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Common English words and conversational filler excluded from TF-IDF analysis
+_STOP_WORDS = {
+    "the", "and", "for", "are", "but", "not", "you", "all", "can", "had",
+    "her", "was", "one", "our", "out", "has", "have", "been", "did",
+    "does", "each", "from", "get", "got", "him", "his", "how", "its",
+    "let", "may", "nor", "own", "say", "she", "too", "use", "that",
+    "than", "them", "then", "they", "this", "what", "when", "who",
+    "why", "will", "with", "also", "back", "come", "could", "into",
+    "just", "know", "like", "look", "make", "more", "most", "much",
+    "must", "need", "only", "over", "some", "such", "take", "tell",
+    "very", "want", "well", "were", "your", "about", "after", "again",
+    "being", "below", "both", "came", "every", "first", "going",
+    "great", "here", "keep", "last", "long", "made", "many", "might",
+    "other", "right", "same", "shall", "should", "since", "still",
+    "their", "there", "these", "thing", "think", "those", "three",
+    "through", "under", "where", "which", "while", "would",
+    "before", "between", "during", "enough", "little", "never",
+    "nothing", "people", "really", "something", "things", "always",
+    "another", "because", "different", "everything", "without",
+    # Conversational filler common in ChatGPT exchanges
+    "please", "thanks", "thank", "hello", "sorry", "okay", "yeah",
+    "sure", "awesome", "perfect", "cool", "actually", "basically",
+    "probably", "definitely", "maybe", "perhaps", "generally",
+    "specifically", "wondering", "question", "answer", "help",
+    "trying", "getting", "making", "looking", "working", "thinking",
+    "doing", "saying", "having", "example", "way", "new", "good",
+    "now", "see", "time", "used", "even", "able", "best", "better",
+    "give", "work", "put", "set", "run", "any", "end", "part",
+    "point", "show", "start", "turn", "world", "yet", "text",
+    "based", "instead", "already", "around", "change", "create",
+    "using", "don", "doesn", "didn", "won", "wouldn", "couldn",
+    "shouldn", "isn", "aren", "wasn", "weren", "hasn", "haven",
+}
+
+
+def _tokenize(text: str) -> List[str]:
+    """Split lowered text into word tokens, filtering stop words and noise."""
+    return [w for w in re.findall(r'[a-z][a-z0-9]+', text.lower())
+            if len(w) >= 3 and w not in _STOP_WORDS]
+
+
+def _get_conv_text(conv: Dict) -> str:
+    """Extract title + first messages as lowercased text for analysis."""
+    text = conv["title"].lower() + " "
+    for m in conv["messages"][:10]:
+        text += m["text"].lower() + " "
+    return text
+
+
+def discover_topics(parsed: List[Dict]) -> Dict[str, List[str]]:
+    """
+    Build topic keyword mappings dynamically from conversation data.
+
+    Starts with TOPIC_SEEDS anchor words, then expands each category by
+    finding terms that frequently co-occur with those seeds using TF-IDF
+    scoring.  Returns a dict in the same shape as the old static
+    TOPIC_KEYWORDS — category name → list of keywords.
+    """
+    n_total = len(parsed)
+    if n_total == 0:
+        return {cat: list(seeds) for cat, seeds in TOPIC_SEEDS.items()}
+
+    # Prepare raw text (for multi-word seed matching) and token sets (for expansion)
+    conv_texts: List[str] = []
+    conv_tokens: List[Set[str]] = []
+    for conv in parsed:
+        text = _get_conv_text(conv)
+        conv_texts.append(text)
+        conv_tokens.append(set(_tokenize(text)))
+
+    # Global document frequency — how many conversations contain each token
+    doc_freq: Counter = Counter()
+    for tokens in conv_tokens:
+        doc_freq.update(tokens)
+
+    result: Dict[str, List[str]] = {}
+
+    for category, seeds in TOPIC_SEEDS.items():
+        # Find conversations matching any seed (substring match supports multi-word)
+        matching = [i for i, text in enumerate(conv_texts)
+                    if any(seed in text for seed in seeds)]
+
+        if len(matching) < 2:
+            result[category] = list(seeds)
+            continue
+
+        # Term frequency across matched conversations
+        term_freq: Counter = Counter()
+        for i in matching:
+            term_freq.update(conv_tokens[i])
+
+        # Score by TF-IDF: frequent in category, distinctive overall
+        n_match = len(matching)
+        scored: List[Tuple[str, float]] = []
+        for term, count in term_freq.items():
+            if count < max(2, int(n_match * 0.1)):
+                continue
+            tf = count / n_match
+            idf = math.log(n_total / max(doc_freq[term], 1))
+            scored.append((term, tf * idf))
+
+        scored.sort(key=lambda x: -x[1])
+        expanded = [t for t, _ in scored[:30] if t not in seeds]
+        result[category] = list(seeds) + expanded
+
+    return result
+
+
+def discover_tech(parsed: List[Dict]) -> List[str]:
+    """
+    Detect tech stack from conversation content.
+
+    Uses a reference set of well-known tech terms for disambiguation (words
+    like "react", "express", "rust" overlap with English) plus dynamic
+    detection of dotted tool names (e.g. node.js, vue.js).
+    """
+    known_tech = {
+        # Languages
+        "python", "javascript", "typescript", "ruby", "rust", "golang",
+        "java", "kotlin", "swift", "php", "perl", "scala", "elixir",
+        "clojure", "haskell", "lua", "dart", "julia", "zig",
+        # Frontend
+        "react", "vue", "angular", "svelte", "nextjs", "next.js",
+        "nuxt", "gatsby", "tailwind", "bootstrap", "jquery",
+        # Backend
+        "django", "flask", "fastapi", "express", "rails", "spring",
+        "laravel", "nestjs",
+        # Databases
+        "postgres", "postgresql", "mysql", "sqlite", "mongodb", "redis",
+        "elasticsearch", "dynamodb", "cassandra",
+        # Infrastructure & cloud
+        "docker", "kubernetes", "terraform", "ansible", "nginx",
+        "aws", "gcp", "azure", "heroku", "vercel", "netlify", "railway",
+        # DevOps & CI
+        "jenkins", "github", "gitlab", "bitbucket",
+        "grafana", "prometheus", "datadog",
+        # Editors & tools
+        "vscode", "neovim", "vim", "emacs", "intellij",
+        "figma", "slack", "notion", "obsidian", "linear", "jira",
+        # Platforms & services
+        "supabase", "firebase", "stripe", "twilio",
+        # Build tools & runtimes
+        "webpack", "vite", "esbuild", "rollup",
+        "node.js", "nodejs", "deno", "bun",
+        # AI/ML
+        "langchain", "pytorch", "tensorflow", "huggingface",
+    }
+
+    found: Set[str] = set()
+    for conv in parsed:
+        combined = " ".join(
+            m["text"].lower() for m in conv["messages"] if m["role"] == "user"
+        )
+        for tech in known_tech:
+            if tech in combined:
+                found.add(tech)
+        # Dynamically detect dotted tool names (e.g. d3.js, three.js)
+        for match in re.findall(r'(?<!\w)([a-z][a-z0-9]*\.(?:js|ts|py|io|rs|go|rb))\b',
+                                combined):
+            found.add(match)
+
+    return sorted(found)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -251,15 +363,12 @@ def parse_all_conversations(conversations: List[Dict]) -> List[Dict]:
 # ANALYSIS
 # ═══════════════════════════════════════════════════════════════════════════
 
-def classify_conversation(conv: Dict) -> List[str]:
-    """Classify a conversation into topic categories."""
-    # Combine title + first ~10 messages for classification
-    text = conv["title"].lower() + " "
-    for m in conv["messages"][:10]:
-        text += m["text"].lower() + " "
+def classify_conversation(conv: Dict, topic_keywords: Dict[str, List[str]]) -> List[str]:
+    """Classify a conversation into topic categories using discovered keywords."""
+    text = _get_conv_text(conv)
 
     scores = {}
-    for category, keywords in TOPIC_KEYWORDS.items():
+    for category, keywords in topic_keywords.items():
         score = sum(1 for kw in keywords if kw in text)
         if score >= 2:
             scores[category] = score
@@ -293,15 +402,7 @@ def fmt_ts_full(ts: Optional[float]) -> str:
 
 def detect_tech_stack(parsed: List[Dict]) -> List[str]:
     """Detect tools and technologies mentioned across all conversations."""
-    found: Set[str] = set()
-    for conv in parsed:
-        combined = " ".join(
-            m["text"].lower() for m in conv["messages"] if m["role"] == "user"
-        )
-        for tech in TECH_PATTERNS:
-            if tech in combined:
-                found.add(tech)
-    return sorted(found)
+    return discover_tech(parsed)
 
 
 def extract_personal_facts(parsed: List[Dict]) -> List[str]:
@@ -342,11 +443,14 @@ def extract_personal_facts(parsed: List[Dict]) -> List[str]:
 
 def analyze_conversations(parsed: List[Dict]) -> Dict:
     """Perform comprehensive analysis."""
+    # Discover topic keywords dynamically from the data
+    topic_keywords = discover_topics(parsed)
+
     categorized: Dict[str, List[Dict]] = defaultdict(list)
     monthly_activity: Dict[str, int] = defaultdict(int)
 
     for conv in parsed:
-        for cat in classify_conversation(conv):
+        for cat in classify_conversation(conv, topic_keywords):
             categorized[cat].append(conv)
         if conv.get("create_time"):
             month = fmt_ts(conv["create_time"])[:7]  # YYYY-MM
@@ -379,6 +483,7 @@ def analyze_conversations(parsed: List[Dict]) -> Dict:
         "model_counts": dict(sorted(model_counts.items(), key=lambda x: -x[1])),
         "tech_stack": detect_tech_stack(parsed),
         "personal_facts": extract_personal_facts(parsed),
+        "topic_keywords": topic_keywords,
     }
 
 
@@ -585,8 +690,9 @@ def generate_conversations_summary(parsed: List[Dict], analysis: Dict, out: str)
         "",
     ]
 
+    topic_keywords = analysis.get("topic_keywords", {})
     for conv in reversed(parsed):
-        cats = classify_conversation(conv)
+        cats = classify_conversation(conv, topic_keywords)
         cat_labels = ", ".join(c.replace("_", " ").title() for c in cats)
         date = fmt_ts(conv.get("create_time"))
 
